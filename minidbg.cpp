@@ -66,6 +66,17 @@ int set_breakpoint(pid_t pid, uintptr_t address, long* opcodes)
     return 0;
 }
 
+int del_breakpoint(pid_t pid, uintptr_t address, long opcodes)
+{
+    if (ptrace(PTRACE_POKETEXT, pid, address, opcodes) == -1) {
+        fprintf(stderr, "ptrace(POKETEXT) failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+
 int attach_all_threads(pid_t pid)
 {
     DIR *proc_dir;
@@ -136,7 +147,7 @@ void show_registers(struct user_regs_struct *regs)
 }
 
 
-int exec_inferior(char* cmd[]) {
+int exec_inferior(char *const cmd[]) {
     if (ptrace(PTRACE_TRACEME, NULL, NULL, NULL) < 0) {
         LOG_ERROR("ptrace(PTRACE_TRACEME failed)");
     } else if (execvp(cmd[0], cmd)) {
@@ -359,32 +370,6 @@ int read_string(int pid, uintptr_t address, char* str, size_t len)
     return count;
 }
 
-int breakpoint_command(int pid)
-{
-    uintptr_t rdi = read_register(pid, RDI);
-    printf("RDI = 0x%08zx\n", rdi);
-
-    char buf[256];
-    read_string(pid, rdi, buf, sizeof(buf));
-    printf("-> %s\n", buf);
-
-    // how to handle remove breakpoint here
-    //
-    return 1; // do not reenable breakpoint
-}
-
-typedef enum
-{
-    TS_NORMAL,
-    TS_BREAKPOINT,
-} trace_state_phase_t;
-
-typedef struct
-{
-    trace_state_phase_t phase;
-    uintptr_t           breakpoint_addr;
-} trace_state_t;
-
 int cont_tracee(event_t* event)
 {
     switch (event->type) {
@@ -395,9 +380,16 @@ int cont_tracee(event_t* event)
             return -1;
         }
         break;
-    /*case ET_GROUP: {
+    case ET_GROUP: {
+        if (!g_signaled) {
+            LOG_DEBUG("restarting tracee %d...", event->pid);
+            if (ptrace(PTRACE_CONT, event->pid, 0, event->sig) == -1) {
+                LOG_ERROR("ptrace(PTRACE_CONT) failed: %s", strerror(errno));
+                return -1;
+            }
+        }
         break;
-    }*/
+    }
     case ET_TERMINATED: {
         break;
     }
@@ -456,6 +448,7 @@ int cont_tracee(event_t* event)
     return 0;
 }
 
+#if 0
 void tracer(pid_t pid)
 {
     //
@@ -541,7 +534,7 @@ void tracer(pid_t pid)
     while (!wait_tracee(&event)) {
         if (g_signaled) {
             //printf("Signaled ...\n");
-            g_signaled = false;
+            //g_signaled = false;
 
             printf("Enter `q` to quit\n");
             printf(">>> ");
@@ -575,7 +568,64 @@ void tracer(pid_t pid)
         }
     }
 }
+#endif
 
+void tracer_init(pid_t pid)
+{
+    //
+    // observe the (initial) signal-delivery-stop
+    //
+    LOG_DEBUG("waiting for initial stop of tracee %d...", pid);
+    int status;
+    do {
+        waitpid(pid, &status, 0);
+        if (g_signaled) {
+            return;
+        }
+    } while (!WIFSTOPPED(status));
+    LOG_DEBUG("initial stop observed");
+
+    //
+    // select ptrace options
+    //
+    int ptrace_options = 0;
+
+    // When delivering system call traps, set bit 7 in the signal number (i.e.,
+    // deliver SIGTRAP|0x80). This makes it easy for the tracer to distinguish
+    // normal traps from those caused by a system call. Note:
+    // PTRACE_O_TRACESYSGOOD may not work on all architectures.
+    ptrace_options |= PTRACE_O_TRACESYSGOOD;
+
+    // Send a SIGKILL signal to the tracee if the tracer exits. This option is
+    // useful for ptrace jailers that want to ensure that tracees can never escape
+    // the tracer's control.
+    ptrace_options |= PTRACE_O_EXITKILL;
+
+    // Stop the tracee at the next clone(2) and automatically start tracing the
+    // newly cloned process, which will start with a SIGSTOP, or PTRACE_EVENT_STOP
+    // if PTRACE_SEIZE was used.  A waitpid(2) by the tracer will return a status
+    // value such that
+    //
+    //  status>>8 == (SIGTRAP | (PTRACE_EVENT_CLONE<<8))
+    //
+    // The PID of the new process can be retrieved with PTRACE_GETEVENTMSG. This
+    // option may not catch clone(2) calls in all cases.  If the tracee calls
+    // clone(2) with the CLONE_VFORK flag, PTRACE_EVENT_VFORK will be delivered
+    // instead if PTRACE_O_TRACEVFORK is set; otherwise if the tracee calls
+    // clone(2) with the exit signal set to SIGCHLD, PTRACE_EVENT_FORK will be
+    // delivered if PTRACE_O_TRACEFORK is set.
+    ptrace_options |= PTRACE_O_TRACECLONE;
+
+    //
+    // set those options
+    //
+    LOG_DEBUG("setting ptrace options...");
+    if (ptrace(PTRACE_SETOPTIONS, pid, 0, ptrace_options) == -1) {
+        LOG_ERROR("ptrace(PTRACE_SETOPTIONS) failed: %s", strerror(errno));
+        return;
+    }
+    LOG_DEBUG("ptrace options set!");
+}
 
 static void sighandler(int)
 {
@@ -589,6 +639,7 @@ void install_sighandler()
     sigaction(SIGINT, &sa, NULL);
 }
 
+#if 0
 int main(int argc, char* argv[])
 {
     const char* usage = "Usage: minidbg [<cmd>|-p <pid>]";
@@ -625,5 +676,157 @@ int main(int argc, char* argv[])
         }
     }
 
+    return 0;
+}
+#endif
+
+struct minidbg_context
+{
+    pid_t pid;
+    event_t event;
+};
+
+struct minidbg_regs
+{
+
+};
+
+extern "C"
+struct minidbg_context* minidbg_start(char *const argv[])
+{
+    int pid = fork();
+    switch(pid) {
+        case -1:
+            LOG_ERROR("fork failed: %s", strerror(errno));
+            return nullptr;
+            break;
+        case 0:
+            exec_inferior(argv);
+            break;
+        default:
+            tracer_init(pid);
+            break;
+    }
+
+    //event_t event {.type = ET_SIGNAL_DELIVERY, .pid = pid};
+    //event.type = ET_SIGNAL_DELIVERY;
+    //event.pid = pid;
+    //event.sig = 0;
+    //event.breakpoint = 0;
+    //event.breakpoints[address] = bp;
+
+    //cont_tracee(&event);
+    uintptr_t address = read_register(pid, RIP);
+
+    minidbg_context* ctx = (minidbg_context*)malloc(sizeof(minidbg_context));
+    ctx->pid = pid;
+    ctx->event = event_t{ET_SIGNAL_DELIVERY, pid, 0, 0, 0, address, std::unordered_map<uintptr_t, Breakpoint>()};
+
+    return ctx;
+}
+
+extern "C"
+struct minidbg_context* minidbg_attach(int pid)
+{
+    if (!attach_all_threads(pid)) {
+        tracer_init(pid);
+    }
+
+    minidbg_context* ctx = (minidbg_context*)malloc(sizeof(minidbg_context));
+    ctx->pid = pid;
+
+    return ctx;
+
+}
+
+extern "C"
+int minidbg_detach(struct minidbg_context* ctx)
+{
+    kill(ctx->pid, SIGSTOP);
+
+    ctx->event.breakpoint = false;
+
+    do {
+        if (cont_tracee(&ctx->event))
+            return -1;
+        if (wait_tracee(&ctx->event))
+            return -1;
+    } while (1);
+
+    int ret = detach(ctx->pid);
+    free(ctx);
+    return ret;
+}
+
+extern "C"
+int minidbg_next(struct minidbg_context* ctx)
+{
+    do {
+        if (cont_tracee(&ctx->event))
+            return -1;
+        if (wait_tracee(&ctx->event))
+            return -1;
+    } while (!ctx->event.breakpoint);
+
+    return 0;
+}
+
+extern "C"
+uintptr_t minidbg_get_pc(struct minidbg_context* ctx)
+{
+    return ctx->event.address;
+}
+
+extern "C"
+uintptr_t minidbg_get_reg(struct minidbg_context* ctx, int reg)
+{
+    return 0;
+}
+
+extern "C"
+int minidbg_get_regs(struct minidbg_context* ctx, struct regs* regs)
+{
+    return 0;
+}
+
+extern "C"
+int minidbg_set_breakpoint(struct minidbg_context* ctx, uintptr_t address)
+{
+    long opcodes;
+
+    if (set_breakpoint(ctx->event.pid, address, &opcodes))
+        return -1;
+
+    ctx->event.breakpoints[address] = Breakpoint {opcodes, true};
+
+    return 0;
+}
+
+extern "C"
+int minidbg_del_breakpoint(struct minidbg_context* ctx, uintptr_t address)
+{
+    const auto bp = ctx->event.breakpoints.find(address);
+    if (bp == ctx->event.breakpoints.end()) {
+        return -1;
+    }
+
+    return del_breakpoint(ctx->event.pid, address, bp->second.bytes);
+}
+
+extern "C"
+uintptr_t minidbg_read_memory(struct minidbg_context* ctx, void* buf, size_t size)
+{
+    return 0;
+}
+
+extern "C"
+uintptr_t minidbg_read_string(struct minidbg_context* ctx, char* buf, size_t size)
+{
+    return 0;
+}
+
+extern "C"
+uintptr_t minidbg_write_memory(struct minidbg_context* ctx, const void* buf, size_t size)
+{
     return 0;
 }
